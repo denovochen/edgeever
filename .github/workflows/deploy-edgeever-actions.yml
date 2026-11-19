@@ -1,0 +1,128 @@
+# @author denovochen
+name: Deploy EdgeEver with GitHub Actions
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: [Update deployed EdgeEver]
+    branches: [main]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: edgeever-production-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.repository == 'denovochen/edgeever' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_repository.full_name == github.repository))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      EDGE_EVER_WORKER_NAME: edgeever
+      EDGE_EVER_D1_DATABASE_NAME: edgeever
+      EDGE_EVER_R2_BUCKET_NAME: edgeever-resources
+      EDGE_EVER_DEPLOYMENT_URL: https://edgeever.denovochen.workers.dev
+      EDGE_EVER_DEPLOYMENT_METHOD: github_actions
+      EDGE_EVER_DEPLOYMENT_TRIGGER: ${{ github.event_name }}
+
+    steps:
+      - name: Checkout deployed main
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Check direct Worker API access and existing authentication
+        run: |
+          node --input-type=module <<'NODE'
+          const account = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          if (!account || !token) throw new Error('Configure CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN in repository Actions secrets.');
+          const url = `https://api.cloudflare.com/client/v4/accounts/${account}/workers/scripts/${process.env.EDGE_EVER_WORKER_NAME}/settings`;
+          const response = await fetch(url, {
+            headers: { Authorization: `Bearer ${token}` },
+            signal: AbortSignal.timeout(15000),
+          });
+          const payload = await response.json();
+          if (!response.ok || payload.success !== true) {
+            throw new Error(`Worker API rejected the request (HTTP ${response.status}): ${JSON.stringify(payload.errors ?? [])}`);
+          }
+          const bindings = payload.result?.bindings ?? [];
+          if (!bindings.some(binding => binding.type === 'secret_text' && ['EDGE_EVER_AUTH_PASSWORD', 'EDGE_EVER_AUTH_PASSWORD_HASH'].includes(binding.name))) {
+            throw new Error('The existing Worker must have a deployed EdgeEver authentication Secret before deployment.');
+          }
+          console.log('Direct Worker settings API is accessible; an authentication Secret is already deployed.');
+          NODE
+
+      - name: Decide whether deployment is needed
+        id: plan
+        env:
+          DEPLOY_EVENT: ${{ github.event_name }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs';
+          const expected = JSON.parse(readFileSync('package.json', 'utf8')).version;
+          let deploy = true;
+          if (process.env.DEPLOY_EVENT === 'workflow_run') {
+            try {
+              const base = process.env.EDGE_EVER_DEPLOYMENT_URL;
+              const responses = await Promise.all(['/api/health', '/api/release'].map(path => fetch(`${base}${path}`, { signal: AbortSignal.timeout(10000) })));
+              if (responses.every(response => response.ok)) {
+                const [health, release] = await Promise.all(responses.map(response => response.json()));
+                deploy = !(health.ok === true && String(release.version ?? '').replace(/^v/, '') === expected);
+              }
+            } catch {
+              deploy = true;
+            }
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, `deploy=${deploy}\n`);
+          appendFileSync(process.env.GITHUB_STEP_SUMMARY, `Target: v${expected}\n\n${deploy ? 'Deploying through the standard Worker API.' : 'The same release is already healthy; deployment is unnecessary.'}\n`);
+          NODE
+
+      - name: Set up Bun
+        if: steps.plan.outputs.deploy == 'true'
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        if: steps.plan.outputs.deploy == 'true'
+        run: |
+          for attempt in 1 2 3; do
+            if bun install --frozen-lockfile; then
+              exit 0
+            fi
+            if [ "$attempt" = "3" ]; then
+              exit 1
+            fi
+            sleep "$((15 * attempt))"
+          done
+
+      - name: Build, migrate, deploy and verify
+        if: steps.plan.outputs.deploy == 'true'
+        run: bun run deploy
+
+      - name: Verify public OpenAPI and release version
+        if: steps.plan.outputs.deploy == 'true'
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs';
+          const expected = JSON.parse(readFileSync('package.json', 'utf8')).version;
+          const base = process.env.EDGE_EVER_DEPLOYMENT_URL;
+          for (const path of ['/api/openapi.json', '/api/release']) {
+            const response = await fetch(`${base}${path}`, { signal: AbortSignal.timeout(15000) });
+            if (!response.ok) throw new Error(`${path} returned HTTP ${response.status}`);
+            const payload = await response.json();
+            if (path === '/api/openapi.json' && payload.ok !== true) throw new Error('OpenAPI response must contain ok=true.');
+            if (path === '/api/release' && String(payload.version ?? '').replace(/^v/, '') !== expected) throw new Error('The live release does not match the checked-out source.');
+            console.log(`[ok] ${path}`);
+          }
+          appendFileSync(process.env.GITHUB_STEP_SUMMARY, `\nDeployed and verified v${expected}: ${base}\n`);
+          NODE
