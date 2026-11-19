@@ -32,7 +32,7 @@ jobs:
       EDGE_EVER_R2_BUCKET_NAME: edgeever-resources
       EDGE_EVER_DEPLOYMENT_URL: https://edgeever.denovochen.workers.dev
       EDGE_EVER_DEPLOYMENT_METHOD: github_actions
-      EDGE_EVER_DEPLOYMENT_TRIGGER: ${{ github.event_name }}
+      EDGE_EVER_DEPLOYMENT_TRIGGER: ${{ github.event_name == 'workflow_run' && 'main_push' || 'manual' }}
 
     steps:
       - name: Checkout deployed main
